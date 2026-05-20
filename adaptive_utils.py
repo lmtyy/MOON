@@ -13,76 +13,105 @@ import torch
 import numpy as np
 from scipy.stats import rankdata
 
-def compute_gradient_divergence(local_model, global_model):
+def compute_gradient_divergence_batch(old_nets, global_model, party_list):
     """
-    计算 local model 相对于 global model 的相对参数漂移。
+    批量计算所有参与 client 的方向散度信号（深层 Cosine Divergence）。
     
-    d_i = ||w_local - w_global|| / ||w_global||
+    d_i = 1 - cos(drift_i, mean_drift)
+    只用 layer4 + fc 的参数，降维提升区分度。
     
-    计算位置：server 端（收到 local model 后）
-    通信开销：零（server 本来就有两个模型）
-    计算开销：O(d)，约 0.01s
+    理论支撑：
+    - SCAFFOLD (Karimireddy et al., ICML 2020): 方向不一致是收敛变慢的根源
+    - FedNova (Wang et al., NeurIPS 2020): 方向偏差导致 objective inconsistency
     
-    理论支撑：FedProx (Li et al., MLSys 2020) Theorem 4
+    参数：
+        old_nets: dict, 上一轮各 client 的 local model（old_nets_pool[-1]）
+        global_model: 当前轮聚合后的 global model
+        party_list: list, 本轮参与的 client id 列表
+    
+    返回：
+        list of float, 每个 client 的方向散度 d_i ∈ [0, 2]
     """
-    local_params = []
+    import torch.nn.functional as F
+    
+    # 目标层：只用深层参数（task-specific layers）
+    target_keywords = ['layer4', 'fc', 'linear', 'l3']
+    
+    # 提取 global model 深层参数
     global_params = []
-    
-    for lp, gp in zip(local_model.parameters(), global_model.parameters()):
-        local_params.append(lp.detach().cpu().view(-1))
-        global_params.append(gp.detach().cpu().view(-1))
-    
-    local_flat = torch.cat(local_params)
+    for name, p in global_model.named_parameters():
+        if any(kw in name for kw in target_keywords):
+            global_params.append(p.detach().cpu().view(-1))
     global_flat = torch.cat(global_params)
     
-    drift = local_flat - global_flat
-    drift_norm = torch.norm(drift).item()
-    global_norm = torch.norm(global_flat).item()
+    # 提取每个 client 的 drift 向量
+    drifts = []
+    for cid in party_list:
+        local_params = []
+        for name, p in old_nets[cid].named_parameters():
+            if any(kw in name for kw in target_keywords):
+                local_params.append(p.detach().cpu().view(-1))
+        local_flat = torch.cat(local_params)
+        drifts.append(local_flat - global_flat)
     
-    d_i = drift_norm / (global_norm + 1e-8)
-    return d_i
+    # 计算平均 drift 方向
+    drift_stack = torch.stack(drifts)  # [N, dim]
+    mean_drift = drift_stack.mean(dim=0)  # [dim]
+    mean_norm = torch.norm(mean_drift)
+    
+    # 计算每个 client 与平均方向的 cosine divergence
+    d_values = []
+    for drift in drifts:
+        drift_norm = torch.norm(drift)
+        if mean_norm < 1e-10 or drift_norm < 1e-10:
+            d_values.append(0.0)
+        else:
+            cos_sim = F.cosine_similarity(
+                drift.unsqueeze(0), mean_drift.unsqueeze(0)
+            ).item()
+            cos_sim = max(-1.0, min(1.0, cos_sim))  # 数值稳定
+            d_values.append(1.0 - cos_sim)
+    
+    return d_values
 
 def compute_distillation_gain(local_model, global_model, dataloader, device, n_batches=3):
     """
-    计算 global model 相对于 local model 的准确率优势。
+    用 KL 散度度量 local 和 global 在该 client 数据上的输出分歧。
     
-    g_i = acc(global, D_i) - acc(local, D_i)
+    g_i = KL(p_global || p_local)
     
     计算位置：client 端（local training 开始前）
     通信开销：上传 1 个 float（可忽略）
     计算开销：3 batch forward pass，约 0.05s
     
-    语义：g_i > 0 表示蒸馏对该 client 有价值
-          g_i < 0 表示 local model 在自己数据上更强
+    语义：g_i 越大 → local 偏离 global 越严重 → 需要更强 contrastive 拉回
+          恒为非负，不会出现 non-IID 下"全负"的问题
     """
+    import torch.nn.functional as F
+    
     local_model.eval()
     global_model.eval()
     
-    local_correct = 0
-    global_correct = 0
-    total = 0
+    kl_sum, n = 0.0, 0
     
     with torch.no_grad():
         for batch_idx, (data, target) in enumerate(dataloader):
             if batch_idx >= n_batches:
                 break
-            data, target = data.to(device), target.to(device).long()
+            data = data.to(device)
             
-            # local model prediction
-            _, _, out_local = local_model(data)
-            local_correct += (out_local.argmax(1) == target).sum().item()
+            _, _, local_out = local_model(data)
+            _, _, global_out = global_model(data)
             
-            # global model prediction
-            _, _, out_global = global_model(data)
-            global_correct += (out_global.argmax(1) == target).sum().item()
+            # temperature=0.5，与 contrastive loss 保持一致
+            local_log_prob = F.log_softmax(local_out / 0.5, dim=1)
+            global_prob = F.softmax(global_out / 0.5, dim=1)
             
-            total += target.size(0)
+            kl = F.kl_div(local_log_prob, global_prob, reduction='batchmean')
+            kl_sum += kl.item()
+            n += 1
     
-    local_acc = local_correct / max(total, 1)
-    global_acc = global_correct / max(total, 1)
-    
-    g_i = global_acc - local_acc  # 允许负值
-    return g_i
+    return kl_sum / max(n, 1)
 
 def rank_normalize(values):
     """

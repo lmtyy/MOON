@@ -9,8 +9,8 @@ import os
 import copy
 import datetime
 import random
-# 在文件顶部 import 区域新增：
-from adaptive_utils import compute_gradient_divergence, compute_distillation_gain, compute_adaptive_lambdas
+import time
+from adaptive_utils import compute_gradient_divergence, compute_gradient_divergence_batch, compute_distillation_gain, compute_adaptive_lambdas
 import wandb
 from scipy.stats import spearmanr, pearsonr
 from model import *
@@ -58,15 +58,15 @@ def get_args():
     parser.add_argument('--use_project_head', type=int, default=1)
     parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')  
     # ===== 新增：AdaMOON v2 参数 =====
-    parser.add_argument('--lambda_min', type=float, default=0.005, 
+    parser.add_argument('--lambda_min', type=float, default=0.1, 
                         help='AdaMOON: lambda lower bound')
-    parser.add_argument('--lambda_max', type=float, default=0.05, 
+    parser.add_argument('--lambda_max', type=float, default=2.0, 
                         help='AdaMOON: lambda upper bound')
     parser.add_argument('--alpha_blend', type=float, default=0.5, 
                         help='AdaMOON: weight for gradient divergence vs distillation gain')
-    parser.add_argument('--adapt_momentum', type=float, default=0.9, 
+    parser.add_argument('--adapt_momentum', type=float, default=0.5, 
                         help='AdaMOON: EMA momentum for lambda smoothing')
-    parser.add_argument('--warmup_rounds', type=int, default=5, 
+    parser.add_argument('--warmup_rounds', type=int, default=3, 
                         help='AdaMOON: number of warmup rounds using center lambda')
     parser.add_argument('--n_eval_batches', type=int, default=3, 
                         help='AdaMOON: number of batches for distillation gain evaluation')
@@ -816,6 +816,7 @@ if __name__ == '__main__':
                         param.requires_grad = False
 
         for round in range(n_comm_rounds):
+            round_start_time = time.time()
             logger.info("in comm round:" + str(round))
             party_list_this_round = party_list_rounds[round]
 
@@ -868,6 +869,15 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
             logger.info('>> Global Model Train loss: %f' % train_loss)
+
+            # ===== 详细日志打印 =====
+            round_time = time.time() - round_start_time
+            print(f'[Round {round}/{args.comm_round}] '
+                f'Test Acc: {test_acc:.4f} | Train Acc: {train_acc:.4f} | '
+                f'Loss: {train_loss:.4f} | μ: {args.mu} | '
+                f'Time: {round_time:.1f}s')
+            remaining = (args.comm_round - round - 1) * round_time
+            print(f'    ETA: {remaining/60:.1f} min remaining')
 
             # ===== wandb 日志（MOON baseline）=====
             if args.use_wandb:
@@ -922,6 +932,7 @@ if __name__ == '__main__':
         lambda_center = (args.lambda_min + args.lambda_max) / 2
 
         for round in range(n_comm_rounds):
+            round_start_time = time.time()
             logger.info("in comm round:" + str(round))
             party_list_this_round = party_list_rounds[round]
 
@@ -962,15 +973,14 @@ if __name__ == '__main__':
                     global_model.to('cpu')
                     g_values.append(g_i)
 
-                # 计算 d_i（用上一轮的 local model vs global model）
-                d_values = []
-                for net_id in party_list_this_round:
-                    if len(old_nets_pool) > 0:
-                        prev_local = old_nets_pool[-1][net_id]
-                    else:
-                        prev_local = nets_this_round[net_id]
-                    d_i = compute_gradient_divergence(prev_local, global_model)
-                    d_values.append(d_i)
+                # 计算 d_i（深层 Cosine Divergence，批量计算）
+                if len(old_nets_pool) > 0:
+                    d_values = compute_gradient_divergence_batch(
+                        old_nets_pool[-1], global_model, party_list_this_round
+                    )
+                else:
+                    # 第一轮没有历史模型，所有 drift = 0，退化为均匀
+                    d_values = [0.0] * len(party_list_this_round)
 
                 # 计算自适应 λ
                 lambda_dict = compute_adaptive_lambdas(
@@ -1036,6 +1046,25 @@ if __name__ == '__main__':
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
             logger.info('>> Global Model Train loss: %f' % train_loss)
             
+            # ===== 详细日志打印 =====
+            round_time = time.time() - round_start_time
+            if round < args.warmup_rounds:
+                print(f'[Round {round}/{args.comm_round}] WARMUP | '
+                    f'Test Acc: {test_acc:.4f} | Train Acc: {train_acc:.4f} | '
+                    f'Loss: {train_loss:.4f} | λ: {lambda_center:.4f} (fixed) | '
+                    f'Time: {round_time:.1f}s')
+            else:
+                lambda_values = [lambda_dict[k] for k in party_list_this_round]
+                print(f'[Round {round}/{args.comm_round}] '
+                    f'Test Acc: {test_acc:.4f} | Train Acc: {train_acc:.4f} | '
+                    f'Loss: {train_loss:.4f} | Time: {round_time:.1f}s')
+                print(f'    λ: mean={np.mean(lambda_values):.5f}, std={np.std(lambda_values):.5f}, '
+                    f'min={np.min(lambda_values):.5f}, max={np.max(lambda_values):.5f}')
+                print(f'    d: mean={np.mean(d_values):.5f}, std={np.std(d_values):.5f}')
+                print(f'    g: mean={np.mean(g_values):.5f}, std={np.std(g_values):.5f}')
+                # 预估剩余时间
+                remaining = (args.comm_round - round - 1) * round_time
+                print(f'    ETA: {remaining/60:.1f} min remaining')
             # ===== wandb 增强日志 =====
             if args.use_wandb:
                 if round < args.warmup_rounds:
